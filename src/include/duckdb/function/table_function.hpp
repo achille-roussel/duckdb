@@ -20,6 +20,7 @@
 #include "duckdb/common/table_column.hpp"
 #include "duckdb/parallel/async_result.hpp"
 #include "duckdb/function/partition_stats.hpp"
+#include "duckdb/function/sorting_order.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/enums/order_preservation_type.hpp"
 
@@ -351,6 +352,9 @@ typedef vector<column_t> (*table_function_get_row_id_columns)(ClientContext &con
 typedef void (*table_function_set_scan_order)(unique_ptr<RowGroupOrderOptions> order_options,
                                               optional_ptr<FunctionData> bind_data);
 
+typedef vector<SortingColumn> (*table_function_get_sorting_order_t)(ClientContext &context,
+                                                                    optional_ptr<const FunctionData> bind_data);
+
 //! When to call init_global to initialize the table function
 enum class TableFunctionInitialization { INITIALIZE_ON_EXECUTE, INITIALIZE_ON_SCHEDULE };
 
@@ -471,6 +475,8 @@ public:
 	table_function_get_row_id_columns get_row_id_columns;
 	//! (Optional) sets the order to scan the row groups in
 	table_function_set_scan_order set_scan_order;
+	//! (Optional) returns the sorting order of the data returned by this table function
+	table_function_get_sorting_order_t get_sorting_order = nullptr;
 
 	table_function_serialize_t serialize;
 	table_function_deserialize_t deserialize;

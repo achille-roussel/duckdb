@@ -5,6 +5,8 @@
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "parquet_crypto.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
+#include "parquet_column_schema.hpp"
 
 namespace duckdb {
 
@@ -263,6 +265,135 @@ static vector<column_t> ParquetGetRowIdColumns(ClientContext &context, optional_
 	return result;
 }
 
+static vector<SortingColumn> ParquetGetSortingOrder(ClientContext &context,
+                                                    optional_ptr<const FunctionData> bind_data_p) {
+	auto &bind_data = bind_data_p->Cast<MultiFileBindData>();
+	vector<SortingColumn> result;
+
+	// Only support single file for now
+	if (bind_data.file_list->GetExpandResult() != FileExpandResult::SINGLE_FILE) {
+		return result;
+	}
+
+	if (!bind_data.initial_reader) {
+		return result;
+	}
+
+	auto &reader = bind_data.initial_reader->Cast<ParquetReader>();
+	auto *metadata = reader.GetFileMetadata();
+
+	if (metadata->row_groups.empty()) {
+		return result;
+	}
+
+	// Get the sorting columns from the first row group
+	auto &first_rg = metadata->row_groups[0];
+	if (!first_rg.__isset.sorting_columns || first_rg.sorting_columns.empty()) {
+		return result;
+	}
+
+	// Start with the first row group's sorting columns
+	for (auto &sort_col : first_rg.sorting_columns) {
+		result.emplace_back(static_cast<column_t>(sort_col.column_idx), sort_col.descending, sort_col.nulls_first);
+	}
+
+	// Compute the common prefix across all row groups
+	for (idx_t i = 1; i < metadata->row_groups.size() && !result.empty(); i++) {
+		auto &rg = metadata->row_groups[i];
+		if (!rg.__isset.sorting_columns || rg.sorting_columns.empty()) {
+			// No sorting info for this row group - common prefix is empty
+			result.clear();
+			break;
+		}
+
+		// Find the common prefix length
+		idx_t common_len = MinValue(result.size(), rg.sorting_columns.size());
+		idx_t prefix_len = 0;
+		for (idx_t j = 0; j < common_len; j++) {
+			auto &existing = result[j];
+			auto &current = rg.sorting_columns[j];
+			if (existing.column_idx == static_cast<column_t>(current.column_idx) &&
+			    existing.descending == current.descending && existing.nulls_first == current.nulls_first) {
+				prefix_len++;
+			} else {
+				break;
+			}
+		}
+
+		// Truncate to the common prefix
+		result.resize(prefix_len);
+	}
+
+	if (result.empty() || metadata->row_groups.size() <= 1) {
+		return result;
+	}
+
+	// Validate that row groups are globally ordered by checking statistics on the first sorted column
+	// For composite sorts like (a, b), only the first column needs global ordering between row groups
+	// Secondary columns only need ordering within groups of equal values in the primary column
+	if (!reader.root_schema) {
+		result.clear();
+		return result;
+	}
+
+	auto &sort_col = result[0];
+	auto table_col_idx = sort_col.column_idx;
+
+	// Find the column schema for this sorted column
+	if (table_col_idx >= reader.root_schema->children.size()) {
+		result.clear();
+		return result;
+	}
+	auto &column_schema = reader.root_schema->children[table_col_idx];
+
+	for (idx_t rg_idx = 0; rg_idx + 1 < metadata->row_groups.size(); rg_idx++) {
+		auto &current_rg = metadata->row_groups[rg_idx];
+		auto &next_rg = metadata->row_groups[rg_idx + 1];
+
+		auto current_stats = column_schema.Stats(*metadata, reader.parquet_options, rg_idx, current_rg.columns);
+		auto next_stats = column_schema.Stats(*metadata, reader.parquet_options, rg_idx + 1, next_rg.columns);
+
+		if (!current_stats || !next_stats) {
+			// Can't verify ordering without stats - be conservative
+			result.clear();
+			return result;
+		}
+
+		// Compare statistics to verify global ordering
+		// Check if we have the required min/max stats
+		if (!NumericStats::HasMax(*current_stats) || !NumericStats::HasMin(*next_stats)) {
+			// Can't verify ordering without stats - be conservative
+			result.clear();
+			return result;
+		}
+
+		Value current_max = NumericStats::Max(*current_stats);
+		Value next_min = NumericStats::Min(*next_stats);
+
+		if (sort_col.descending) {
+			// DESC: min(current) >= max(next)
+			if (!NumericStats::HasMin(*current_stats) || !NumericStats::HasMax(*next_stats)) {
+				result.clear();
+				return result;
+			}
+			Value current_min = NumericStats::Min(*current_stats);
+			Value next_max = NumericStats::Max(*next_stats);
+			if (current_min < next_max) {
+				result.clear();
+				return result;
+			}
+		} else {
+			// ASC: max(current) <= min(next)
+			if (current_max > next_min) {
+				result.clear();
+				return result;
+			}
+		}
+	}
+
+	return result;
+}
+
 static vector<PartitionStatistics> ParquetGetPartitionStats(ClientContext &context, GetPartitionStatsInput &input) {
 	auto &bind_data = input.bind_data->Cast<MultiFileBindData>();
 	vector<PartitionStatistics> result;
@@ -329,6 +460,7 @@ TableFunctionSet ParquetScanFunction::GetFunctionSet() {
 	table_function.get_row_id_columns = ParquetGetRowIdColumns;
 	table_function.pushdown_expression = ParquetScanPushdownExpression;
 	table_function.get_partition_stats = ParquetGetPartitionStats;
+	table_function.get_sorting_order = ParquetGetSortingOrder;
 	table_function.filter_pushdown = true;
 	table_function.filter_prune = true;
 	table_function.late_materialization = true;
