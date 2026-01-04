@@ -47,7 +47,7 @@ struct CSVMultiFileInfo : MultiFileReaderInterface {
 	                                                 unique_ptr<BaseFileReaderOptions> options) override;
 	void BindReader(ClientContext &context, vector<LogicalType> &return_types, vector<string> &names,
 	                MultiFileBindData &bind_data) override;
-	void FinalizeBindData(MultiFileBindData &multi_file_data) override;
+	void FinalizeBindData(ClientContext &context, MultiFileBindData &multi_file_data) override;
 	optional_idx MaxThreads(const MultiFileBindData &bind_data_p, const MultiFileGlobalState &global_state,
 	                        FileExpandResult expand_result) override;
 	unique_ptr<GlobalTableFunctionState> InitializeGlobalState(ClientContext &context, MultiFileBindData &bind_data,

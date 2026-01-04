@@ -34,7 +34,7 @@ struct MultiFileReaderInterface {
 	                                                         unique_ptr<BaseFileReaderOptions> options) = 0;
 	virtual void BindReader(ClientContext &context, vector<LogicalType> &return_types, vector<string> &names,
 	                        MultiFileBindData &bind_data) = 0;
-	virtual void FinalizeBindData(MultiFileBindData &multi_file_data);
+	virtual void FinalizeBindData(ClientContext &context, MultiFileBindData &multi_file_data);
 	virtual void GetBindInfo(const TableFunctionData &bind_data, BindInfo &info);
 	virtual optional_idx MaxThreads(const MultiFileBindData &bind_data_p, const MultiFileGlobalState &global_state,
 	                                FileExpandResult expand_result);
@@ -108,7 +108,7 @@ public:
 			result->file_options.AutoDetectHivePartitioning(*result->file_list, context);
 			interface.BindReader(context, result->types, result->names, *result);
 		}
-		interface.FinalizeBindData(*result);
+		interface.FinalizeBindData(context, *result);
 
 		if (return_types.empty()) {
 			// no expected types - just copy the types

@@ -107,6 +107,12 @@
       "paths": [
         "test/sql/storage/external_file_cache/external_file_cache_validate.test"
       ]
+    },
+    {
+      "reason": "Parquet metadata cache cannot persist across database restarts when force_restart is enabled.",
+      "paths": [
+        "test/optimizer/sort_elimination.test"
+      ]
     }
   ]
 }
