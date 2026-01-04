@@ -21,7 +21,7 @@ optional_idx MultiFileReaderInterface::MaxThreads(const MultiFileBindData &bind_
 	return optional_idx();
 }
 
-void MultiFileReaderInterface::FinalizeBindData(MultiFileBindData &multi_file_data) {
+void MultiFileReaderInterface::FinalizeBindData(ClientContext &context, MultiFileBindData &multi_file_data) {
 }
 
 shared_ptr<BaseFileReader> MultiFileReaderInterface::CreateReader(ClientContext &context, const OpenFileInfo &file,

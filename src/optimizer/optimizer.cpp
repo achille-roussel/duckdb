@@ -25,6 +25,7 @@
 #include "duckdb/optimizer/remove_duplicate_groups.hpp"
 #include "duckdb/optimizer/remove_unused_columns.hpp"
 #include "duckdb/optimizer/row_group_pruner.hpp"
+#include "duckdb/optimizer/sort_elimination.hpp"
 #include "duckdb/optimizer/rule/distinct_aggregate_optimizer.hpp"
 #include "duckdb/optimizer/rule/equal_or_null_simplification.hpp"
 #include "duckdb/optimizer/rule/in_clause_simplification.hpp"
@@ -227,6 +228,13 @@ void Optimizer::RunBuiltInOptimizers() {
 	RunOptimizer(OptimizerType::COMMON_SUBEXPRESSIONS, [&]() {
 		CommonSubExpressionOptimizer cse_optimizer(binder);
 		cse_optimizer.VisitOperator(*plan);
+	});
+
+	// eliminate redundant ORDER BY when data is already sorted
+	// (must run before COLUMN_LIFETIME which adds projections)
+	RunOptimizer(OptimizerType::SORT_ELIMINATION, [&]() {
+		SortElimination sort_elimination(context);
+		plan = sort_elimination.Optimize(std::move(plan));
 	});
 
 	// creates projection maps so unused columns are projected out early

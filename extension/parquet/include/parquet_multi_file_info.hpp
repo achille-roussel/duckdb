@@ -37,7 +37,7 @@ struct ParquetMultiFileInfo : MultiFileReaderInterface {
 	                MultiFileBindData &bind_data) override;
 	unique_ptr<TableFunctionData> InitializeBindData(MultiFileBindData &multi_file_data,
 	                                                 unique_ptr<BaseFileReaderOptions> options) override;
-	void FinalizeBindData(MultiFileBindData &multi_file_data) override;
+	void FinalizeBindData(ClientContext &context, MultiFileBindData &multi_file_data) override;
 	void GetBindInfo(const TableFunctionData &bind_data, BindInfo &info) override;
 	optional_idx MaxThreads(const MultiFileBindData &bind_data, const MultiFileGlobalState &global_state,
 	                        FileExpandResult expand_result) override;

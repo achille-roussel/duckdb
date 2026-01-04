@@ -5,6 +5,8 @@
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "parquet_crypto.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
+#include "parquet_column_schema.hpp"
 
 namespace duckdb {
 
@@ -263,6 +265,321 @@ static vector<column_t> ParquetGetRowIdColumns(ClientContext &context, optional_
 	return result;
 }
 
+//===--------------------------------------------------------------------===//
+// Helper: Validate row group ordering within a single file's metadata
+//===--------------------------------------------------------------------===//
+static bool ValidateSingleFileRowGroupOrdering(const duckdb_parquet::FileMetaData &metadata,
+                                               const ParquetColumnSchema &column_schema,
+                                               const ParquetOptions &parquet_options, const SortingColumn &sort_col) {
+	for (idx_t rg_idx = 0; rg_idx + 1 < metadata.row_groups.size(); rg_idx++) {
+		auto &current_rg = metadata.row_groups[rg_idx];
+		auto &next_rg = metadata.row_groups[rg_idx + 1];
+
+		auto current_stats = column_schema.Stats(metadata, parquet_options, rg_idx, current_rg.columns);
+		auto next_stats = column_schema.Stats(metadata, parquet_options, rg_idx + 1, next_rg.columns);
+
+		if (!current_stats || !next_stats) {
+			return false;
+		}
+
+		if (!NumericStats::HasMax(*current_stats) || !NumericStats::HasMin(*next_stats)) {
+			return false;
+		}
+
+		Value current_max = NumericStats::Max(*current_stats);
+		Value next_min = NumericStats::Min(*next_stats);
+
+		if (sort_col.descending) {
+			if (!NumericStats::HasMin(*current_stats) || !NumericStats::HasMax(*next_stats)) {
+				return false;
+			}
+			Value current_min = NumericStats::Min(*current_stats);
+			Value next_max = NumericStats::Max(*next_stats);
+			if (current_min < next_max) {
+				return false;
+			}
+		} else {
+			if (current_max > next_min) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+//===--------------------------------------------------------------------===//
+// Helper: File statistics for sorting
+//===--------------------------------------------------------------------===//
+struct FileStatistics {
+	idx_t file_idx;
+	Value min_val;
+	Value max_val;
+};
+
+//===--------------------------------------------------------------------===//
+// Helper: Extract min/max statistics from each file's first row group
+// Returns empty vector on failure
+//===--------------------------------------------------------------------===//
+static vector<FileStatistics> ExtractFileStatistics(const vector<shared_ptr<ParquetFileMetadataCache>> &file_caches,
+                                                    const ParquetColumnSchema &column_schema,
+                                                    const ParquetOptions &parquet_options) {
+	vector<FileStatistics> result;
+	for (idx_t i = 0; i < file_caches.size(); i++) {
+		auto &metadata = *file_caches[i]->metadata;
+		if (metadata.row_groups.empty()) {
+			return {};
+		}
+
+		auto &first_rg = metadata.row_groups[0];
+		auto stats = column_schema.Stats(metadata, parquet_options, 0, first_rg.columns);
+		if (!stats || !NumericStats::HasMin(*stats) || !NumericStats::HasMax(*stats)) {
+			return {};
+		}
+
+		result.push_back({i, NumericStats::Min(*stats), NumericStats::Max(*stats)});
+	}
+	return result;
+}
+
+//===--------------------------------------------------------------------===//
+// Helper: Sort files by their statistics to determine optimal ordering
+//===--------------------------------------------------------------------===//
+static vector<idx_t> SortFilesByStatistics(vector<FileStatistics> &stats, bool descending) {
+	if (descending) {
+		// DESC: sort by max value descending (highest max first)
+		std::sort(stats.begin(), stats.end(),
+		          [](const FileStatistics &a, const FileStatistics &b) { return a.max_val > b.max_val; });
+	} else {
+		// ASC: sort by min value ascending (lowest min first)
+		std::sort(stats.begin(), stats.end(),
+		          [](const FileStatistics &a, const FileStatistics &b) { return a.min_val < b.min_val; });
+	}
+
+	vector<idx_t> order;
+	for (auto &s : stats) {
+		order.push_back(s.file_idx);
+	}
+	return order;
+}
+
+//===--------------------------------------------------------------------===//
+// Helper: Validate ordering between files (last RG of file[i] vs first RG of file[i+1])
+//===--------------------------------------------------------------------===//
+static bool ValidateCrossFileOrdering(const vector<shared_ptr<ParquetFileMetadataCache>> &file_caches,
+                                      const vector<idx_t> &sorted_order, const ParquetColumnSchema &column_schema,
+                                      const ParquetOptions &parquet_options, const SortingColumn &sort_col) {
+	for (idx_t i = 0; i + 1 < sorted_order.size(); i++) {
+		idx_t current_idx = sorted_order[i];
+		idx_t next_idx = sorted_order[i + 1];
+		auto &current_meta = *file_caches[current_idx]->metadata;
+		auto &next_meta = *file_caches[next_idx]->metadata;
+
+		if (current_meta.row_groups.empty() || next_meta.row_groups.empty()) {
+			return false;
+		}
+
+		// Get last row group of current file
+		idx_t last_rg_idx = current_meta.row_groups.size() - 1;
+		auto &last_rg = current_meta.row_groups[last_rg_idx];
+
+		// Get first row group of next file
+		auto &first_rg = next_meta.row_groups[0];
+
+		// Get statistics
+		auto last_stats = column_schema.Stats(current_meta, parquet_options, last_rg_idx, last_rg.columns);
+		auto first_stats = column_schema.Stats(next_meta, parquet_options, 0, first_rg.columns);
+
+		if (!last_stats || !first_stats) {
+			return false;
+		}
+
+		if (!NumericStats::HasMax(*last_stats) || !NumericStats::HasMin(*first_stats)) {
+			return false;
+		}
+
+		Value last_max = NumericStats::Max(*last_stats);
+		Value first_min = NumericStats::Min(*first_stats);
+
+		if (sort_col.descending) {
+			if (!NumericStats::HasMin(*last_stats) || !NumericStats::HasMax(*first_stats)) {
+				return false;
+			}
+			Value last_min = NumericStats::Min(*last_stats);
+			Value first_max = NumericStats::Max(*first_stats);
+			if (last_min < first_max) {
+				return false;
+			}
+		} else {
+			if (last_max > first_min) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+//===--------------------------------------------------------------------===//
+// Helper: Compute common sorting prefix across all row groups in metadata
+//===--------------------------------------------------------------------===//
+static void ComputeCommonSortingPrefix(const duckdb_parquet::FileMetaData &metadata, vector<SortingColumn> &result,
+                                       bool &initialized) {
+	for (idx_t rg_idx = 0; rg_idx < metadata.row_groups.size(); rg_idx++) {
+		auto &rg = metadata.row_groups[rg_idx];
+		if (!rg.__isset.sorting_columns || rg.sorting_columns.empty()) {
+			// No sorting info for this row group - common prefix is empty
+			result.clear();
+			initialized = true;
+			return;
+		}
+
+		if (!initialized) {
+			// Initialize from first row group encountered
+			for (auto &sort_col : rg.sorting_columns) {
+				result.emplace_back(static_cast<column_t>(sort_col.column_idx), sort_col.descending,
+				                    sort_col.nulls_first);
+			}
+			initialized = true;
+		} else {
+			// Find the common prefix length
+			idx_t common_len = MinValue(result.size(), rg.sorting_columns.size());
+			idx_t prefix_len = 0;
+			for (idx_t j = 0; j < common_len; j++) {
+				auto &existing = result[j];
+				auto &current = rg.sorting_columns[j];
+				if (existing.column_idx == static_cast<column_t>(current.column_idx) &&
+				    existing.descending == current.descending && existing.nulls_first == current.nulls_first) {
+					prefix_len++;
+				} else {
+					break;
+				}
+			}
+			// Truncate to the common prefix
+			result.resize(prefix_len);
+		}
+
+		// If common prefix is now empty, no point continuing
+		if (result.empty() && initialized) {
+			return;
+		}
+	}
+}
+
+//===--------------------------------------------------------------------===//
+// ParquetGetSortingOrder - Main function
+//===--------------------------------------------------------------------===//
+static vector<SortingColumn> ParquetGetSortingOrder(ClientContext &context,
+                                                    optional_ptr<const FunctionData> bind_data_p) {
+	auto &bind_data = bind_data_p->Cast<MultiFileBindData>();
+	vector<SortingColumn> result;
+
+	auto expand_result = bind_data.file_list->GetExpandResult();
+	if (expand_result == FileExpandResult::NO_FILES) {
+		return result;
+	}
+
+	if (!bind_data.initial_reader) {
+		return result;
+	}
+
+	auto &initial_reader = bind_data.initial_reader->Cast<ParquetReader>();
+	auto &parquet_options = initial_reader.parquet_options;
+
+	// Collect metadata for all files
+	vector<shared_ptr<ParquetFileMetadataCache>> file_caches;
+
+	if (bind_data.file_list->GetExpandResult() == FileExpandResult::SINGLE_FILE) {
+		// Single file - use metadata from initial_reader directly
+		file_caches.push_back(initial_reader.metadata);
+	} else {
+		// Multiple files - require metadata caching
+		if (!ParquetReader::MetadataCacheEnabled(context)) {
+			return result;
+		}
+		// Collect cached metadata for all files
+		// Note: We skip cache validation for sorting order because:
+		// 1. Sorting metadata is read-only optimization information
+		// 2. If the cache is stale, we might miss an optimization but correctness is preserved
+		// 3. Parquet sorting order is immutable - a file change would invalidate the entire cache
+		for (auto &file : bind_data.file_list->Files()) {
+			auto cache_entry = ParquetReader::GetMetadataCacheEntry(context, file);
+			if (!cache_entry) {
+				// No cache entry - bail
+				return result;
+			}
+			file_caches.push_back(std::move(cache_entry));
+		}
+	}
+
+	if (file_caches.empty()) {
+		return result;
+	}
+
+	// Compute common sorting prefix across ALL row groups in ALL files
+	bool initialized = false;
+	for (idx_t file_idx = 0; file_idx < file_caches.size(); file_idx++) {
+		auto &metadata = *file_caches[file_idx]->metadata;
+		ComputeCommonSortingPrefix(metadata, result, initialized);
+		if (result.empty() && initialized) {
+			// Common prefix became empty - no point continuing
+			return result;
+		}
+	}
+
+	if (result.empty()) {
+		return result;
+	}
+
+	// Validate ordering using statistics on the first sorted column
+	// For composite sorts like (a, b), only the first column needs global ordering
+	if (!initial_reader.root_schema) {
+		result.clear();
+		return result;
+	}
+
+	auto &sort_col = result[0];
+	auto table_col_idx = sort_col.column_idx;
+
+	if (table_col_idx >= initial_reader.root_schema->children.size()) {
+		result.clear();
+		return result;
+	}
+	auto &column_schema = initial_reader.root_schema->children[table_col_idx];
+
+	// Validate row group ordering within each file
+	for (auto &cache : file_caches) {
+		auto &metadata = *cache->metadata;
+		if (metadata.row_groups.size() > 1) {
+			if (!ValidateSingleFileRowGroupOrdering(metadata, column_schema, parquet_options, sort_col)) {
+				result.clear();
+				return result;
+			}
+		}
+	}
+
+	// Validate ordering between files (if multiple files)
+	if (file_caches.size() > 1) {
+		// Extract statistics from each file to determine optimal ordering
+		auto file_stats = ExtractFileStatistics(file_caches, column_schema, parquet_options);
+		if (file_stats.empty()) {
+			result.clear();
+			return result;
+		}
+
+		// Sort files by their statistics to find the correct order
+		// Note: FinalizeBindData attempts to reorder files, but may fail if cache isn't populated
+		// So we compute the sorted order here to be robust
+		auto sorted_order = SortFilesByStatistics(file_stats, sort_col.descending);
+
+		// Validate cross-file ordering using the sorted order
+		if (!ValidateCrossFileOrdering(file_caches, sorted_order, column_schema, parquet_options, sort_col)) {
+			result.clear();
+			return result;
+		}
+	}
+
+	return result;
+}
+
 static vector<PartitionStatistics> ParquetGetPartitionStats(ClientContext &context, GetPartitionStatsInput &input) {
 	auto &bind_data = input.bind_data->Cast<MultiFileBindData>();
 	vector<PartitionStatistics> result;
@@ -329,6 +646,7 @@ TableFunctionSet ParquetScanFunction::GetFunctionSet() {
 	table_function.get_row_id_columns = ParquetGetRowIdColumns;
 	table_function.pushdown_expression = ParquetScanPushdownExpression;
 	table_function.get_partition_stats = ParquetGetPartitionStats;
+	table_function.get_sorting_order = ParquetGetSortingOrder;
 	table_function.filter_pushdown = true;
 	table_function.filter_prune = true;
 	table_function.late_materialization = true;
@@ -469,7 +787,94 @@ optional_idx ParquetMultiFileInfo::MaxThreads(const MultiFileBindData &bind_data
 	return MaxValue(bind_data.initial_file_row_groups, static_cast<idx_t>(1));
 }
 
-void ParquetMultiFileInfo::FinalizeBindData(MultiFileBindData &multi_file_data) {
+//! Reorders files in the file list so that they are sorted by their sorting column statistics.
+//! This ensures that when ORDER BY is eliminated, reading files in list order produces sorted output.
+static void ReorderFilesBySortingColumn(ClientContext &context, MultiFileBindData &bind_data) {
+	// Only applicable for multiple files with caching enabled
+	if (bind_data.file_list->GetExpandResult() != FileExpandResult::MULTIPLE_FILES) {
+		return;
+	}
+	if (!ParquetReader::MetadataCacheEnabled(context)) {
+		return;
+	}
+	if (!bind_data.initial_reader) {
+		return;
+	}
+
+	auto &initial_reader = bind_data.initial_reader->Cast<ParquetReader>();
+	auto &parquet_options = initial_reader.parquet_options;
+
+	// Collect cached metadata for all files
+	vector<shared_ptr<ParquetFileMetadataCache>> file_caches;
+	vector<OpenFileInfo> files;
+	for (auto &file : bind_data.file_list->Files()) {
+		auto cache_entry = ParquetReader::GetMetadataCacheEntry(context, file);
+		if (!cache_entry) {
+			return; // No cache, can't reorder
+		}
+		file_caches.push_back(std::move(cache_entry));
+		files.push_back(file);
+	}
+
+	if (file_caches.empty()) {
+		return;
+	}
+
+	// Compute common sorting prefix across all files
+	vector<SortingColumn> sorting_cols;
+	bool initialized = false;
+	for (auto &cache : file_caches) {
+		ComputeCommonSortingPrefix(*cache->metadata, sorting_cols, initialized);
+		if (sorting_cols.empty() && initialized) {
+			return; // No common sorting
+		}
+	}
+
+	if (sorting_cols.empty()) {
+		return;
+	}
+
+	// Get column schema for statistics extraction
+	if (!initial_reader.root_schema) {
+		return;
+	}
+	auto &sort_col = sorting_cols[0];
+	if (sort_col.column_idx >= initial_reader.root_schema->children.size()) {
+		return;
+	}
+	auto &column_schema = initial_reader.root_schema->children[sort_col.column_idx];
+
+	// Extract statistics and compute sorted order
+	auto file_stats = ExtractFileStatistics(file_caches, column_schema, parquet_options);
+	if (file_stats.empty()) {
+		return;
+	}
+	auto sorted_order = SortFilesByStatistics(file_stats, sort_col.descending);
+
+	// Check if already in order - no need to reorder
+	bool already_sorted = true;
+	for (idx_t i = 0; i < sorted_order.size(); i++) {
+		if (sorted_order[i] != i) {
+			already_sorted = false;
+			break;
+		}
+	}
+	if (already_sorted) {
+		return;
+	}
+
+	// Reorder the files according to sorted_order
+	vector<OpenFileInfo> reordered_files;
+	reordered_files.reserve(sorted_order.size());
+	for (idx_t sorted_idx : sorted_order) {
+		reordered_files.push_back(std::move(files[sorted_idx]));
+	}
+
+	// Replace the file list with reordered version
+	bind_data.file_list = make_shared_ptr<SimpleMultiFileList>(std::move(reordered_files));
+}
+
+void ParquetMultiFileInfo::FinalizeBindData(ClientContext &context, MultiFileBindData &multi_file_data) {
 	auto &bind_data = multi_file_data.bind_data->Cast<ParquetReadBindData>();
 	if (multi_file_data.initial_reader) {
 		auto &initial_reader = multi_file_data.initial_reader->Cast<ParquetReader>();
@@ -477,6 +882,9 @@ void ParquetMultiFileInfo::FinalizeBindData(MultiFileBindData &multi_file_data) 
 		bind_data.initial_file_row_groups = initial_reader.NumRowGroups();
 		bind_data.options->options = initial_reader.parquet_options;
 	}
+
+	// Reorder files for sort elimination optimization
+	ReorderFilesBySortingColumn(context, multi_file_data);
 }
 
 unique_ptr<NodeStatistics> ParquetMultiFileInfo::GetCardinality(const MultiFileBindData &bind_data_p,

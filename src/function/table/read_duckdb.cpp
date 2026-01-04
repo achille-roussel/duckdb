@@ -22,7 +22,7 @@ struct DuckDBMultiFileInfo : MultiFileReaderInterface {
 	                 BaseFileReaderOptions &options) override;
 	void FinalizeCopyBind(ClientContext &context, BaseFileReaderOptions &options, const vector<string> &expected_names,
 	                      const vector<LogicalType> &expected_types) override;
-	void FinalizeBindData(MultiFileBindData &multi_file_data) override;
+	void FinalizeBindData(ClientContext &context, MultiFileBindData &multi_file_data) override;
 
 	unique_ptr<TableFunctionData> InitializeBindData(MultiFileBindData &multi_file_data,
 	                                                 unique_ptr<BaseFileReaderOptions> options) override;
@@ -404,7 +404,7 @@ void DuckDBMultiFileInfo::FinalizeCopyBind(ClientContext &context, BaseFileReade
 	throw InternalException("Unimplemented method in DuckDBMultiFileInfo");
 }
 
-void DuckDBMultiFileInfo::FinalizeBindData(MultiFileBindData &multi_file_data) {
+void DuckDBMultiFileInfo::FinalizeBindData(ClientContext &context, MultiFileBindData &multi_file_data) {
 	auto &bind_data = multi_file_data.bind_data->Cast<DuckDBReadBindData>();
 	if (multi_file_data.initial_reader) {
 		auto &initial_reader = multi_file_data.initial_reader->Cast<DuckDBReader>();

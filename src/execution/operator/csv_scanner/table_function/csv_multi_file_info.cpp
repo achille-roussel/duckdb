@@ -210,7 +210,7 @@ void CSVMultiFileInfo::BindReader(ClientContext &context, vector<LogicalType> &r
 	}
 }
 
-void CSVMultiFileInfo::FinalizeBindData(MultiFileBindData &multi_file_data) {
+void CSVMultiFileInfo::FinalizeBindData(ClientContext &context, MultiFileBindData &multi_file_data) {
 	auto &csv_data = multi_file_data.bind_data->Cast<ReadCSVData>();
 	auto &names = multi_file_data.names;
 	auto &options = csv_data.options;
